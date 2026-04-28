@@ -856,12 +856,11 @@ def filter_district_municipality_contracts(df: pd.DataFrame, district: str) -> p
         t = norm(org)
         if not t:
             return False
-        if not is_municipality(t):
-            return False
+        # If it's explicitly labeled as a municipality or matches our target list, we keep it
         for m in municipality_norm:
             if not m:
                 continue
-            if t == m:
+            if t == m or m in t:
                 return True
             if t == f"obec {m}" or t == f"mesto {m}" or t == f"mestsky cast {m}":
                 return True
@@ -935,12 +934,10 @@ def filter_by_selected_municipalities(df: pd.DataFrame, selected_municipalities:
         t = norm(org)
         if not t:
             return False
-        if not is_municipality(t):
-            return False
         for m in selected_norm:
             if not m:
                 continue
-            if t == m:
+            if t == m or m in t:
                 return True
             if t == f"obec {m}" or t == f"mesto {m}" or t == f"mestsky cast {m}":
                 return True
@@ -1081,7 +1078,7 @@ def _run_job(job_id: str) -> None:
 
     try:
         cancel_check()
-        # Increased lookback to 2 years to catch 1-year contracts that might have been published earlier
+        # Lookback to 2 years (730 days) as requested for reliability
         lookback_days = 730
         log(f"Beží spracovanie pre okres {district} (lookback {lookback_days} dní).")
         contracts, used_sources, export_url, export_date = load_contracts_source(
