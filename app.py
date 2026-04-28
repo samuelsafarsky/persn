@@ -176,6 +176,8 @@ def norm(text: str) -> str:
     out = re.sub(r"\s+", " ", out)
     return out
 
+_ALL_MUNICIPALITIES_NORM = {norm(m) for m_list in MANUAL_DISTRICT_MUNICIPALITIES.values() for m in m_list}
+
 
 def parse_date(value: str | None) -> datetime | None:
     if not value:
@@ -304,7 +306,8 @@ def detect_person_name(values: dict[str, str]) -> str:
 
 def is_municipality(customer: str) -> bool:
     c = norm(customer)
-    return (
+    # Check prefixes
+    if (
         c.startswith("obec ")
         or c.startswith("mesto ")
         or c.startswith("mestsky cast ")
@@ -312,7 +315,13 @@ def is_municipality(customer: str) -> bool:
         or c.startswith("mestsky urad ")
         or " obec " in f" {c} "
         or " mesto " in f" {c} "
-    )
+    ):
+        return True
+
+    # Robust check: if the name is exactly one of our known municipalities from the mapping
+    if c in _ALL_MUNICIPALITIES_NORM:
+        return True
+    return False
 
 
 def extract_unit_price_eur_mwh(text: str, commodity: str) -> float | None:
@@ -392,36 +401,19 @@ def format_eur(value: float | None) -> str:
 
 
 def is_probably_energy_contract(row: pd.Series) -> bool:
-    t = norm(f"{row.get('title','')} {row.get('search_blob','')}")
-    if "elektronick" in t and "elektrina" not in t and "elektrickej energie" not in t:
+    # If commodity is already detected as energy, we trust it
+    # unless it's a known false positive like electronic services
+    if row.get("commodity") not in ("elektrina", "plyn"):
         return False
-    if row.get("commodity") == "elektrina":
-        return any(
-            m in t
-            for m in (
-                "elektrina",
-                "elektricka energia",
-                "elektrickej energie",
-                "dodavka elektr",
-                "odber elektr",
-                "silova energia",
-                "mwh",
-                "kwh",
-            )
-        )
-    if row.get("commodity") == "plyn":
-        return any(
-            m in t
-            for m in (
-                "zemny plyn",
-                "dodavka plynu",
-                "odber plynu",
-                "komodita plyn",
-                "mwh",
-                "kwh",
-            )
-        )
-    return False
+
+    t = norm(f"{row.get('title','')} {row.get('search_blob','')}")
+    if "elektronick" in t:
+        # Check if it has strong energy markers to override the false positive
+        energy_markers = ("mwh", "kwh", "silova", "plynu", "zemny plyn")
+        if not any(m in t for m in energy_markers):
+            return False
+
+    return True
 
 
 def estimate_duration_months(row: pd.Series) -> int:
@@ -638,6 +630,7 @@ def extract_records_from_xml(
         blob = " ".join(values.values())
         commodity = detect_commodity(" ".join([title, contract_number, blob]))
 
+        parsed_published = parse_date(published_raw)
         parsed_valid_from = parse_date(valid_from_raw)
         parsed_valid_to = parse_date(valid_to_raw)
 
@@ -653,9 +646,13 @@ def extract_records_from_xml(
         if parsed_valid_to is None and len(dates_from_text) > 1:
             parsed_valid_to = dates_from_text[-1]
 
+        if parsed_published is None:
+            # Fallback for ranking if publication date is missing
+            parsed_published = parsed_valid_from
+
         rows.append(
             ContractRecord(
-                published_at=parse_date(published_raw),
+                published_at=parsed_published,
                 valid_from=parsed_valid_from,
                 valid_to=parsed_valid_to,
                 contract_number=contract_number,
@@ -1084,7 +1081,8 @@ def _run_job(job_id: str) -> None:
 
     try:
         cancel_check()
-        lookback_days = 180
+        # Increased lookback to 2 years to catch 1-year contracts that might have been published earlier
+        lookback_days = 730
         log(f"Beží spracovanie pre okres {district} (lookback {lookback_days} dní).")
         contracts, used_sources, export_url, export_date = load_contracts_source(
             upload_zip=upload_zip,
@@ -1259,7 +1257,7 @@ def discover():
         contracts, _, _, _ = load_contracts_source(
             upload_zip=upload_zip,
             upload_name=upload_name,
-            lookback_days=120,
+            lookback_days=365,
             cancel_check=lambda: None,
             log=log,
         )
@@ -1304,11 +1302,17 @@ def discover():
         options = []
         for _, r in options_df.iterrows():
             contracts_count = int(r["contracts"]) if pd.notna(r["contracts"]) else 0
+            latest_val = "N/A"
+            if pd.notna(r["latest"]):
+                dt = pd.to_datetime(r["latest"])
+                if dt.year > 1970:
+                    latest_val = dt.strftime("%d.%m.%Y")
+
             options.append(
                 {
                     "name": str(r["name"]),
                     "contracts": contracts_count if contracts_count > 0 else None,
-                    "latest": pd.to_datetime(r["latest"]).strftime("%d.%m.%Y") if pd.notna(r["latest"]) else "N/A",
+                    "latest": latest_val,
                 }
             )
         return jsonify({"ok": True, "district": district, "options": options, "logs": logs[-20:]})
