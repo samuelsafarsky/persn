@@ -29,44 +29,17 @@ CRZ_EXPORT_URLS = [
 ]
 BENCHMARKS = {"elektrina": 112.5, "plyn": 29.0}
 DEFAULT_MONTHLY_MWH = {"elektrina": 18.0, "plyn": 30.0}
-MANUAL_DISTRICT_MUNICIPALITIES = {
-    "senica": [
-        "Borský Svätý Jur",
-        "Cerová",
-        "Čáry",
-        "Dojč",
-        "Gbely",
-        "Hlboké",
-        "Hradište pod Vrátnom",
-        "Jablonica",
-        "Kátov",
-        "Koválovec",
-        "Kuklov",
-        "Kúty",
-        "Lakšárska Nová Ves",
-        "Moravský Svätý Ján",
-        "Osuské",
-        "Petrova Ves",
-        "Plavecký Peter",
-        "Podbranč",
-        "Popudinské Močidľany",
-        "Prietrž",
-        "Prievaly",
-        "Radimov",
-        "Radošovce",
-        "Rohov",
-        "Rovensko",
-        "Sekule",
-        "Senica",
-        "Smolinské",
-        "Smrdáky",
-        "Sobotište",
-        "Šajdíkove Humence",
-        "Šaštín-Stráže",
-        "Štefanov",
-        "Unín",
-    ]
-}
+
+def _load_municipality_mapping():
+    p = APP_DIR / "municipality_mapping.json"
+    if p.exists():
+        try:
+            return json.loads(p.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+    return {}
+
+MANUAL_DISTRICT_MUNICIPALITIES = _load_municipality_mapping()
 
 
 @dataclass
@@ -203,6 +176,8 @@ def norm(text: str) -> str:
     out = re.sub(r"\s+", " ", out)
     return out
 
+_ALL_MUNICIPALITIES_NORM = {norm(m) for m_list in MANUAL_DISTRICT_MUNICIPALITIES.values() for m in m_list}
+
 
 def parse_date(value: str | None) -> datetime | None:
     if not value:
@@ -299,8 +274,15 @@ def detect_commodity(text: str) -> str:
         "zdruzena dodavka plynu",
         "komodita plyn",
     )
-    if "elektronick" in t and not any(k in t for k in electric_markers):
-        return "ine"
+
+    # Filter out non-energy false positives like "elektronicke sluzby"
+    if "elektronick" in t:
+        # Only accept if it ALSO contains strong energy markers
+        has_electric = any(k in t for k in electric_markers)
+        has_gas = any(k in t for k in gas_markers)
+        if not (has_electric or has_gas):
+            return "ine"
+
     if any(k in t for k in electric_markers):
         return "elektrina"
     if any(k in t for k in gas_markers):
@@ -324,7 +306,8 @@ def detect_person_name(values: dict[str, str]) -> str:
 
 def is_municipality(customer: str) -> bool:
     c = norm(customer)
-    return (
+    # Check prefixes
+    if (
         c.startswith("obec ")
         or c.startswith("mesto ")
         or c.startswith("mestsky cast ")
@@ -332,54 +315,75 @@ def is_municipality(customer: str) -> bool:
         or c.startswith("mestsky urad ")
         or " obec " in f" {c} "
         or " mesto " in f" {c} "
-    )
+    ):
+        return True
+
+    # Robust check: if the name is exactly one of our known municipalities from the mapping
+    if c in _ALL_MUNICIPALITIES_NORM:
+        return True
+    return False
 
 
 def extract_unit_price_eur_mwh(text: str, commodity: str) -> float | None:
     t = norm(text)
-    pattern = re.compile(r"(\d{1,4}(?:[\.,]\d{1,4})?)\s*(?:eur|€)?\s*/\s*(mwh|kwh)")
+    # Improved regex to handle various spacing and formats
+    pattern = re.compile(r"(\d{1,4}(?:[\s\.]\d{3})*(?:[\.,]\d{1,4})?)\s*(?:eur|€)?\s*/\s*(mwh|kwh)", re.IGNORECASE)
     matches = list(pattern.finditer(t))
+
+    # Secondary pattern for "cena za 1 mwh je 123,45" or "cena ... 150 eur"
+    if not matches:
+        pattern2 = re.compile(r"(?:cena|sadzba).*?(\d{1,4}(?:[\.,]\d{1,4})?)\s*(?:eur|€)", re.IGNORECASE)
+        for m in pattern2.finditer(t):
+            start = max(0, m.start() - 50)
+            end = min(len(t), m.end() + 50)
+            window = t[start:end]
+            if "mwh" in window or "kwh" in window:
+                # We'll treat this as a potential match
+                val = parse_decimal(m.group(1))
+                if val:
+                    if "kwh" in window and "mwh" not in window:
+                         val = val * 1000.0
+                    if 5 <= val <= 1000:
+                        return val
+
     if not matches:
         return None
 
     values: list[float] = []
     for m in matches:
         raw_num = m.group(1)
-        unit = m.group(2)
+        unit = m.group(2).lower()
         value = parse_decimal(raw_num)
         if value is None:
             continue
         if unit == "kwh":
             value = value * 1000.0
+
         start = max(0, m.start() - 70)
         end = min(len(t), m.end() + 70)
         window = t[start:end]
 
-        if commodity == "elektrina" and "elektr" not in window and "silov" not in window:
-            continue
-        if commodity == "plyn" and "plyn" not in window and "gas" not in window:
-            continue
+        # Context scoring
+        score = 0
+        if commodity == "elektrina" and ("elektr" in window or "silov" in window):
+            score += 2
+        if commodity == "plyn" and ("plyn" in window or "zemn" in window):
+            score += 2
+        if "cena" in window or "jednotk" in window:
+            score += 1
 
-        values.append(value)
-
-    if not values:
-        for m in matches:
-            raw_num = m.group(1)
-            unit = m.group(2)
-            value = parse_decimal(raw_num)
-            if value is None:
-                continue
-            if unit == "kwh":
-                value = value * 1000.0
-            values.append(value)
+        values.append((value, score))
 
     if not values:
         return None
 
-    plausible = [v for v in values if 5 <= v <= 500]
+    # Sort by score descending, then by plausibility
+    values.sort(key=lambda x: x[1], reverse=True)
+
+    plausible = [v[0] for v in values if 5 <= v[0] <= 800]
     if plausible:
         return plausible[0]
-    return values[0]
+    return values[0][0]
 
 
 def format_price(value: float | None) -> str:
@@ -397,36 +401,19 @@ def format_eur(value: float | None) -> str:
 
 
 def is_probably_energy_contract(row: pd.Series) -> bool:
-    t = norm(f"{row.get('title','')} {row.get('search_blob','')}")
-    if "elektronick" in t and "elektrina" not in t and "elektrickej energie" not in t:
+    # If commodity is already detected as energy, we trust it
+    # unless it's a known false positive like electronic services
+    if row.get("commodity") not in ("elektrina", "plyn"):
         return False
-    if row.get("commodity") == "elektrina":
-        return any(
-            m in t
-            for m in (
-                "elektrina",
-                "elektricka energia",
-                "elektrickej energie",
-                "dodavka elektr",
-                "odber elektr",
-                "silova energia",
-                "mwh",
-                "kwh",
-            )
-        )
-    if row.get("commodity") == "plyn":
-        return any(
-            m in t
-            for m in (
-                "zemny plyn",
-                "dodavka plynu",
-                "odber plynu",
-                "komodita plyn",
-                "mwh",
-                "kwh",
-            )
-        )
-    return False
+
+    t = norm(f"{row.get('title','')} {row.get('search_blob','')}")
+    if "elektronick" in t:
+        # Check if it has strong energy markers to override the false positive
+        energy_markers = ("mwh", "kwh", "silova", "plynu", "zemny plyn")
+        if not any(m in t for m in energy_markers):
+            return False
+
+    return True
 
 
 def estimate_duration_months(row: pd.Series) -> int:
@@ -462,7 +449,15 @@ def estimate_monthly_savings(row: pd.Series) -> tuple[float | None, str, str]:
         if total_f > 0 and unit_price_f > 0 and diff_f > 0 and months > 0:
             monthly_mwh = (total_f / unit_price_f) / months
             monthly_savings = monthly_mwh * diff_f
-            return monthly_savings, "jednotkova_cena", "vysoka"
+            # If we have both total price and unit price, it's very reliable
+            return monthly_savings, "jednotková cena + hodnota zmluvy", "vysoká"
+
+    if pd.notna(unit_price) and pd.notna(diff) and float(diff) > 0:
+        # Fallback if we have unit price but not total price: use default monthly MWH
+        commodity = str(row.get("commodity") or "")
+        mwh = DEFAULT_MONTHLY_MWH.get(commodity, 10.0)
+        monthly_savings = mwh * float(diff)
+        return monthly_savings, "jednotková cena + odhad odberu", "stredná"
 
     if pd.notna(total):
         total_f = float(total)
@@ -472,18 +467,18 @@ def estimate_monthly_savings(row: pd.Series) -> tuple[float | None, str, str]:
             bench = BENCHMARKS.get(commodity)
             mwh = DEFAULT_MONTHLY_MWH.get(commodity)
             if bench and mwh:
-                return bench * mwh * 0.12, "model_12pct_benchmark", "nizka"
-            return None, "insufficient_total_price", "nizka"
+                return bench * mwh * 0.12, "modelový odhad (12% benchmarku)", "nízka"
+            return None, "nedostatočné údaje", "nízka"
         monthly_base = total_f / max(1, months)
         monthly_savings = monthly_base * 0.12
-        return monthly_savings, "12_percent_fallback", "stredna"
+        return monthly_savings, "12% z celkovej hodnoty", "stredná"
 
     commodity = str(row.get("commodity") or "")
     bench = BENCHMARKS.get(commodity)
     mwh = DEFAULT_MONTHLY_MWH.get(commodity)
     if bench and mwh:
-        return bench * mwh * 0.12, "model_12pct_benchmark", "nizka"
-    return None, "insufficient_data", "nizka"
+        return bench * mwh * 0.12, "modelový odhad (12% benchmarku)", "nízka"
+    return None, "nedostatok dát", "nízka"
 
 
 def _cache_zip_path(ds: str) -> Path:
@@ -561,6 +556,19 @@ def download_latest_crz_zip(
     )
 
 
+def _extract_valid_to_from_text(text: str) -> datetime | None:
+    if not text:
+        return None
+    # Look for "do 31.12.2025" or similar
+    m = re.search(r"do\s*(\d{1,2})\.(\d{1,2})\.(\d{4})", text, re.IGNORECASE)
+    if m:
+        d, mth, y = map(int, m.groups())
+        try:
+            return datetime(y, mth, d)
+        except ValueError:
+            pass
+    return None
+
 def extract_records_from_xml(
     xml_bytes: bytes,
     cancel_check: Callable[[], None],
@@ -622,17 +630,29 @@ def extract_records_from_xml(
         blob = " ".join(values.values())
         commodity = detect_commodity(" ".join([title, contract_number, blob]))
 
+        parsed_published = parse_date(published_raw)
         parsed_valid_from = parse_date(valid_from_raw)
         parsed_valid_to = parse_date(valid_to_raw)
+
+        # Fallback to text_ucinnost or search_blob if explicit field is missing
+        if parsed_valid_to is None:
+            parsed_valid_to = _extract_valid_to_from_text(text_ucinnost)
+        if parsed_valid_to is None:
+            parsed_valid_to = _extract_valid_to_from_text(blob)
+
         dates_from_text = extract_dates_from_text(text_ucinnost)
         if parsed_valid_from is None and dates_from_text:
             parsed_valid_from = dates_from_text[0]
-        if parsed_valid_to is None and dates_from_text:
+        if parsed_valid_to is None and len(dates_from_text) > 1:
             parsed_valid_to = dates_from_text[-1]
+
+        if parsed_published is None:
+            # Fallback for ranking if publication date is missing
+            parsed_published = parsed_valid_from
 
         rows.append(
             ContractRecord(
-                published_at=parse_date(published_raw),
+                published_at=parsed_published,
                 valid_from=parsed_valid_from,
                 valid_to=parsed_valid_to,
                 contract_number=contract_number,
@@ -720,7 +740,7 @@ def collect_contracts_window(
     for delta in range(days_back + 1):
         cancel_check()
         if progress:
-            progress(delta + 1, days_back + 1, "download_parse")
+            progress(delta, days_back + 1, "CRZ scan")
         d = today - timedelta(days=delta)
         ds = d.strftime("%Y-%m-%d")
         content, source = download_zip_for_date(ds, cancel_check=cancel_check, log=log)
@@ -836,12 +856,11 @@ def filter_district_municipality_contracts(df: pd.DataFrame, district: str) -> p
         t = norm(org)
         if not t:
             return False
-        if not is_municipality(t):
-            return False
+        # If it's explicitly labeled as a municipality or matches our target list, we keep it
         for m in municipality_norm:
             if not m:
                 continue
-            if t == m:
+            if t == m or m in t:
                 return True
             if t == f"obec {m}" or t == f"mesto {m}" or t == f"mestsky cast {m}":
                 return True
@@ -915,12 +934,10 @@ def filter_by_selected_municipalities(df: pd.DataFrame, selected_municipalities:
         t = norm(org)
         if not t:
             return False
-        if not is_municipality(t):
-            return False
         for m in selected_norm:
             if not m:
                 continue
-            if t == m:
+            if t == m or m in t:
                 return True
             if t == f"obec {m}" or t == f"mesto {m}" or t == f"mestsky cast {m}":
                 return True
@@ -1033,6 +1050,11 @@ def load_contracts_source(
 
 
 def _run_job(job_id: str) -> None:
+    # Ensure job exists before starting
+    with JOBS_LOCK:
+        if job_id not in JOBS:
+            return
+
     snapshot = _snapshot(job_id)
     if not snapshot:
         return
@@ -1056,8 +1078,9 @@ def _run_job(job_id: str) -> None:
 
     try:
         cancel_check()
-        lookback_days = 180
-        log("Bezi 1 job; prechadzaju sa denné exporty v lookback okne.")
+        # Lookback to 2 years (730 days) as requested for reliability
+        lookback_days = 730
+        log(f"Beží spracovanie pre okres {district} (lookback {lookback_days} dní).")
         contracts, used_sources, export_url, export_date = load_contracts_source(
             upload_zip=upload_zip,
             upload_name=upload_name,
@@ -1197,7 +1220,10 @@ def discover():
     if not district:
         return jsonify({"ok": False, "error": "Zadaj okres."}), 400
 
-    manual_fast = MANUAL_DISTRICT_MUNICIPALITIES.get(norm(district), [])
+    district_n = norm(district)
+    manual_fast = MANUAL_DISTRICT_MUNICIPALITIES.get(district_n, [])
+
+    # If we have it in our mapping, we return it immediately to be fast.
     if manual_fast:
         options = [{"name": x, "contracts": None, "latest": "N/A"} for x in manual_fast]
         return jsonify(
@@ -1205,7 +1231,7 @@ def discover():
                 "ok": True,
                 "district": district,
                 "options": options,
-                "logs": ["Rychly vyber obci pripraveny. Pocet zmluv sa vyhodnoti az pri spracovani vybranych obci."],
+                "logs": ["Rýchly výber obcí pripravený z lokálnej databázy. Počet zmlúv sa vyhodnotí až pri spracovaní."],
                 "warning": "",
             }
         )
@@ -1228,7 +1254,7 @@ def discover():
         contracts, _, _, _ = load_contracts_source(
             upload_zip=upload_zip,
             upload_name=upload_name,
-            lookback_days=120,
+            lookback_days=365,
             cancel_check=lambda: None,
             log=log,
         )
@@ -1273,11 +1299,17 @@ def discover():
         options = []
         for _, r in options_df.iterrows():
             contracts_count = int(r["contracts"]) if pd.notna(r["contracts"]) else 0
+            latest_val = "N/A"
+            if pd.notna(r["latest"]):
+                dt = pd.to_datetime(r["latest"])
+                if dt.year > 1970:
+                    latest_val = dt.strftime("%d.%m.%Y")
+
             options.append(
                 {
                     "name": str(r["name"]),
                     "contracts": contracts_count if contracts_count > 0 else None,
-                    "latest": pd.to_datetime(r["latest"]).strftime("%d.%m.%Y") if pd.notna(r["latest"]) else "N/A",
+                    "latest": latest_val,
                 }
             )
         return jsonify({"ok": True, "district": district, "options": options, "logs": logs[-20:]})
